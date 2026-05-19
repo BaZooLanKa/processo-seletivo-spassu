@@ -1,0 +1,108 @@
+Desafio AD - TJRJ - Spassu - Parte 4
+
+No script:
+
+INSERT INTO recurso_acao_processo (
+	id_recurso_acao_processo,
+	nome,
+	ativo,
+	data_inclusao,
+	id_usuario_inclusao
+) VALUES (
+	532,
+	'Vincular boleto',
+	1,
+	NAW(),
+	id_user_homologacao
+);
+
+- A função NAW(), presente em VALUES, não existe. Trata-se, na verdade, da função NOW(), que trás a data atual;
+- O valor 532, atribuído ao id_recurso_acao_processo, por ser fixo, é um problema que deve ser tratado, para preservar a integridade, e não dar erro de chave duplicada;
+- A variável id_user_homologacao (que é um valor externo) deve ser tratada, conforme o ambiente que se deseja aplicar o script (Dev, Homolog, Prod, etc);
+- Como esse script fará parte de um migration, é preciso deixá-lo preparado para todas as situações acima, para ocorrer o versionamento;
+- Não é obrigatório, mas encapsular o script numa procedure vai melhorar a construção e o controle, bem como manter a integridade e segurança do DML;
+
+A Solução contempla criar uma procedure, que efetue o DML necessário, conforme os parâmetros passados, e retorne ao fluxo do migration:
+
+DELIMITER $$
+
+CREATE PROCEDURE sp_recurso_acao_processo_upsert(
+    IN p_id_recurso INT,
+    IN p_nome VARCHAR(255),
+    IN p_ativo TINYINT,
+    IN p_login_usuario VARCHAR(100),
+    IN p_atualiza_dados BOOLEAN,
+    OUT p_status_codigo INT,      -- 1: Inserido, 2: Atualizado, 0: Sem alterações, -1: Erro
+    OUT p_status_mensagem VARCHAR(255)
+)
+BEGIN
+    DECLARE v_id_usuario INT;
+    DECLARE v_linhas_afetadas INT;
+
+    -- Tratamento de erros/exceções do MySQL
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        GET DIAGNOSTICS CONDITION 1 p_status_mensagem = MESSAGE_TEXT;
+        SET p_status_codigo = -1;
+        ROLLBACK;
+    END;
+
+    START TRANSACTION;
+
+    -- 1. Busca dinâmica do ID do usuário pelo login numa hipotética tabela de usuários (independência de ambiente)
+    SELECT id_usuario INTO v_id_usuario 
+    FROM tb_usuario 
+    WHERE nm_login = p_login_usuario 
+    LIMIT 1;
+
+    -- Validação de consistência do usuário
+    IF v_id_usuario IS NULL THEN
+        SET p_status_codigo = -1;
+        SET p_status_mensagem = CONCAT('Erro: Usuário "', p_login_usuario, '" não cadastrado neste ambiente.');
+        ROLLBACK;
+    ELSE
+        -- 2. O Conceito de UPSERT nativo do MySQL
+        INSERT INTO recurso_acao_processo (
+            id_recurso_acao_processo,
+            nome,
+            ativo,
+            data_inclusao,
+            id_usuario_inclusao
+        ) VALUES (
+            p_id_recurso,
+            p_nome,
+            p_ativo,
+            NOW(),
+            v_id_usuario
+        )
+        ON DUPLICATE KEY UPDATE
+            -- Se o ID já existir, o MySQL executa o bloco abaixo (condicionalmente, de acordo com a necessidade):
+            nome = IF(p_atualiza_dados, VALUES(nome), nome),
+            ativo = IF(p_atualiza_dados, VALUES(ativo), ativo),
+            data_inclusao = IF(p_atualiza_dados, VALUES(data_inclusao), data_inclusao),
+            id_usuario_inclusao = IF(p_atualiza_dados, VALUES(id_usuario_inclusao), id_usuario_inclusao);
+
+        -- 3. Captura do Status real através do ROW_COUNT() do motor do MySQL
+        SET v_linhas_afetadas = ROW_COUNT();
+
+        -- No MySQL, o ROW_COUNT() para ON DUPLICATE KEY retorna:
+        -- 1 se a linha foi inserida nova.
+        -- 2 se uma linha existente foi atualizada com novos valores.
+        -- 0 se a linha já existia mas os dados passados eram exatamente iguais aos atuais.
+
+		SET p_status_codigo = v_linhas_afetadas;
+
+		CASE p_status_codigo
+			WHEN 1 THEN
+				SET p_status_mensagem = 'Sucesso: Registro inserido com êxito.';
+            WHEN 2 THEN
+				SET p_status_mensagem = 'Sucesso: Registro já existia e foi atualizado (Upsert).';
+            WHEN 0 THEN
+				SET p_status_mensagem = 'Ignorado: Registro já existia com os mesmos dados. Nenhuma alteração necessária.';
+		END CASE;
+
+        COMMIT;
+    END IF;
+END$$
+
+DELIMITER ;
